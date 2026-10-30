@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0f172a">
+<link rel="manifest" href="manifest.json">
+<title>Scan OCR</title>
+<style>
+:root{--bg:#0f172a;--card:#1e293b;--txt:#f1f5f9;--mut:#94a3b8;--acc:#6366f1;--ok:#22c55e;--bad:#ef4444}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--txt);padding:16px;max-width:720px;margin-inline:auto}
+h1{font-size:22px;margin:4px 0 14px}
+.card{background:var(--card);border-radius:16px;padding:14px;margin-bottom:14px}
+.row{display:flex;gap:10px;flex-wrap:wrap}
+button,label.btn,select{font:inherit;border:0;border-radius:12px;padding:14px 16px;background:#334155;color:var(--txt);flex:1;min-height:48px;text-align:center;cursor:pointer}
+button.main{background:var(--acc);font-weight:600}
+button:disabled{opacity:.5}
+input[type=file]{display:none}
+img#apercu{max-width:100%;border-radius:12px;display:block;margin:auto}
+textarea{width:100%;min-height:260px;background:#0b1220;color:var(--txt);border:1px solid #334155;border-radius:12px;padding:12px;font:16px/1.5 system-ui;resize:vertical}
+progress{width:100%;height:10px}
+.mut{color:var(--mut);font-size:14px}
+.err{color:var(--bad)} .ok{color:var(--ok)}
+.hist{display:flex;justify-content:space-between;gap:8px;align-items:center;padding:10px 0;border-bottom:1px solid #334155}
+.hist span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.hist button{flex:0;padding:8px 12px;min-height:36px}
+.hide{display:none}
+</style>
+</head>
+<body>
+<h1>📷 Scan OCR</h1>
+
+<div class="card">
+  <div class="row">
+    <label class="btn main" for="camera">Prendre une photo</label>
+    <label class="btn" for="galerie">Importer une image</label>
+  </div>
+  <input id="camera" type="file" accept="image/*" capture="environment">
+  <input id="galerie" type="file" accept="image/jpeg,image/png,image/webp">
+  <p class="mut" id="statut">Choisis une photo pour commencer.</p>
+</div>
+
+<div class="card hide" id="boxApercu">
+  <img id="apercu" alt="Aperçu">
+  <div class="row" style="margin-top:10px">
+    <select id="langue"><option value="fra">Français</option></select>
+    <select id="filtre">
+      <option value="aucun">Image d'origine</option>
+      <option value="gris">Gris + contraste</option>
+    </select>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <button class="main" id="btnOcr">Reconnaître le texte</button>
+    <button id="btnStop" class="hide">Annuler</button>
+  </div>
+  <progress id="prog" class="hide" max="1" value="0"></progress>
+  <p class="mut" id="etape"></p>
+</div>
+
+<div class="card hide" id="boxRes">
+  <textarea id="texte" spellcheck="false"></textarea>
+  <p class="mut" id="compte"></p>
+  <p class="mut" id="doutes"></p>
+  <div class="row">
+    <button id="btnCopier">Copier</button>
+    <button id="btnTxt">Télécharger .txt</button>
+    <button id="btnPartager">Partager</button>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <button id="btnOriginal">Revenir au texte OCR original</button>
+    <button class="main" id="btnSauver">Enregistrer</button>
+  </div>
+</div>
+
+<div class="card">
+  <strong>Historique</strong>
+  <div id="histo"></div>
+  <button id="btnVider" style="margin-top:10px">Vider l'historique</button>
+</div>
+
+<script src="lib/tesseract.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+let image = null, worker = null, annule = false, texteOriginal = '';
+
+// --- Service worker (hors ligne) ---
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('service-worker.js').catch(()=>{});
+
+// --- Vérification du moteur ---
+if (typeof Tesseract === 'undefined') {
+  $('statut').innerHTML = '<span class="err">Moteur OCR introuvable : le dossier lib/ est incomplet.</span>';
+}
+
+// --- Import d'image ---
+['camera','galerie'].forEach(id => $(id).addEventListener('change', e => {
+  const f = e.target.files[0]; if (!f) return;
+  if (!/^image\/(jpeg|png|webp)/.test(f.type)) { $('statut').innerHTML = '<span class="err">Format non pris en charge (JPEG, PNG, WebP).</span>'; return; }
+  image = f;
+  $('apercu').src = URL.createObjectURL(f);
+  $('boxApercu').classList.remove('hide');
+  $('boxRes').classList.add('hide');
+  $('statut').textContent = 'Image prête. Appuie sur « Reconnaître le texte ».';
+}));
+
+// --- Préparation de l'image (réduite à 2200 px max, filtre optionnel) ---
+async function preparer(file, filtre) {
+  const bmp = await createImageBitmap(file);
+  const k = Math.min(1, 2200 / Math.max(bmp.width, bmp.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
+  const g = c.getContext('2d'); g.drawImage(bmp, 0, 0, c.width, c.height);
+  bmp.close && bmp.close();
+  if (filtre === 'gris') {
+    const d = g.getImageData(0, 0, c.width, c.height), p = d.data;
+    for (let i = 0; i < p.length; i += 4) {
+      let v = 0.299*p[i] + 0.587*p[i+1] + 0.114*p[i+2];
+      v = Math.max(0, Math.min(255, (v - 128) * 1.4 + 128));
+      p[i] = p[i+1] = p[i+2] = v;
+    }
+    g.putImageData(d, 0, 0);
+  }
+  return c;
+}
+
+// --- OCR réel ---
+$('btnOcr').addEventListener('click', async () => {
+  if (!image) return;
+  if (typeof Tesseract === 'undefined') { $('etape').innerHTML = '<span class="err">Moteur OCR absent.</span>'; return; }
+  annule = false;
+  $('btnOcr').disabled = true; $('btnStop').classList.remove('hide'); $('prog').classList.remove('hide');
+  $('prog').value = 0; $('etape').textContent = 'Préparation de l\'image…';
+  try {
+    const canvas = await preparer(image, $('filtre').value);
+    $('etape').textContent = 'Chargement du moteur…';
+    worker = await Tesseract.createWorker($('langue').value, 1, {
+      workerPath: 'lib/worker.min.js',
+      corePath: 'lib/',
+      langPath: 'lang/',
+      gzip: true,
+      logger: m => {
+        if (typeof m.progress === 'number') {
+          $('prog').value = m.progress;
+          $('etape').textContent = m.status + ' ' + Math.round(m.progress * 100) + ' %';
+        }
+      }
+    });
+    const { data } = await worker.recognize(canvas);
+    if (annule) return;
+    texteOriginal = data.text;
+    $('texte').value = data.text;
+    $('boxRes').classList.remove('hide');
+    majCompte();
+    // Mots peu fiables : scores réels fournis par Tesseract
+    const douteux = (data.words || []).filter(w => w.confidence < 70).map(w => w.text);
+    $('doutes').textContent = douteux.length
+      ? 'Mots à vérifier (confiance < 70 %) : ' + [...new Set(douteux)].slice(0, 40).join(', ')
+      : 'Aucun mot signalé comme peu fiable.';
+    $('etape').innerHTML = '<span class="ok">Terminé.</span>';
+    $('boxRes').scrollIntoView({behavior:'smooth'});
+  } catch (err) {
+    if (!annule) $('etape').innerHTML = '<span class="err">Échec : ' + (err.message || err) + '. Vérifie que lang/fra.traineddata.gz et lib/ sont présents.</span>';
+  } finally {
+    if (worker) { try { await worker.terminate(); } catch(e){} worker = null; }
+    $('btnOcr').disabled = false; $('btnStop').classList.add('hide'); $('prog').classList.add('hide');
+  }
+});
+$('btnStop').addEventListener('click', async () => {
+  annule = true;
+  if (worker) { try { await worker.terminate(); } catch(e){} worker = null; }
+  $('etape').textContent = 'Annulé.';
+});
+
+// --- Éditeur ---
+function majCompte() {
+  const t = $('texte').value.trim();
+  $('compte').textContent = t.length + ' caractères · ' + (t ? t.split(/\s+/).length : 0) + ' mots';
+}
+$('texte').addEventListener('input', majCompte);
+$('btnOriginal').addEventListener('click', () => { $('texte').value = texteOriginal; majCompte(); });
+
+// --- Exports ---
+$('btnCopier').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText($('texte').value); $('etape').innerHTML = '<span class="ok">Copié.</span>'; }
+  catch(e) { $('texte').select(); document.execCommand('copy'); }
+});
+$('btnTxt').addEventListener('click', () => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([$('texte').value], {type:'text/plain;charset=utf-8'}));
+  a.download = 'scan-ocr.txt'; a.click();
+});
+$('btnPartager').addEventListener('click', async () => {
+  if (navigator.share) { try { await navigator.share({text: $('texte').value}); } catch(e){} }
+  else $('etape').innerHTML = '<span class="err">Le partage n\'est pas disponible sur ce navigateur.</span>';
+});
+
+// --- Historique (localStorage, texte seulement) ---
+const CLE = 'scan-ocr-histo';
+const lire = () => { try { return JSON.parse(localStorage.getItem(CLE)) || []; } catch(e){ return []; } };
+function afficherHisto() {
+  const h = lire(), box = $('histo'); box.innerHTML = '';
+  if (!h.length) { box.innerHTML = '<p class="mut">Rien d\'enregistré.</p>'; return; }
+  h.forEach((d, i) => {
+    const l = document.createElement('div'); l.className = 'hist';
+    const s = document.createElement('span'); s.textContent = d.nom;  // textContent : jamais interprété comme HTML
+    const o = document.createElement('button'); o.textContent = 'Ouvrir';
+    o.onclick = () => { $('texte').value = d.texte; texteOriginal = d.texte; $('boxRes').classList.remove('hide'); majCompte(); };
+    const x = document.createElement('button'); x.textContent = '✕';
+    x.onclick = () => { if (confirm('Supprimer « ' + d.nom + ' » ?')) { h.splice(i,1); localStorage.setItem(CLE, JSON.stringify(h)); afficherHisto(); } };
+    l.append(s, o, x); box.append(l);
+  });
+}
+$('btnSauver').addEventListener('click', () => {
+  const nom = prompt('Nom du document :', 'Scan ' + new Date().toLocaleString('fr-FR'));
+  if (!nom) return;
+  try {
+    const h = lire(); h.unshift({nom, texte: $('texte').value});
+    localStorage.setItem(CLE, JSON.stringify(h)); afficherHisto();
+    $('etape').innerHTML = '<span class="ok">Enregistré.</span>';
+  } catch(e) { $('etape').innerHTML = '<span class="err">Échec de l\'enregistrement (stockage plein ?).</span>'; }
+});
+$('btnVider').addEventListener('click', () => {
+  if (confirm('Vider tout l\'historique ?')) { localStorage.removeItem(CLE); afficherHisto(); }
+});
+afficherHisto();
+</script>
+</body>
+</html>
